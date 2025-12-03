@@ -1,0 +1,57 @@
+.qs-container {
+  max-width: 600px;
+  margin: auto;
+  padding: 40px 20px;
+  text-align: center;
+}
+
+.qs-sub {
+  color: #9aa0b5;
+  margin-bottom: 20px;
+}
+
+.qs-card {
+  background: rgba(255,255,255,0.05);
+  border-radius: 18px;
+  padding: 24px;
+  border: 1px solid rgba(255,255,255,0.08);
+  backdrop-filter: blur(8px);
+}
+
+.qs-step { display: none; }
+.qs-step.active { display: block; }
+
+.qs-field {
+  text-align: left;
+  margin-bottom: 16px;
+}
+.qs-field input, .qs-field select {
+  width: 100%;
+}
+
+.qs-field-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.mode-switch {
+  margin: 14px 0;
+  display: flex;
+  justify-content: space-between;
+}
+
+.qs-dots {
+  margin-top: 20px;
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+}
+.dot {
+  width: 10px;
+  height: 10px;
+  background: #666;
+  border-radius: 50%;
+}
+.dot.active { background: #05d0c5; }

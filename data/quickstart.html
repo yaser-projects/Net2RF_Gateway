@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quick Start - Metal Brain</title>
+
+  <link rel="stylesheet" href="css/base.css">
+  <link rel="stylesheet" href="css/quickstart.css">
+</head>
+
+<body>
+
+  <script type="module">
+    import { requireAuth } from "./js/auth.js";
+    requireAuth();
+  </script>
+
+  <div class="qs-container">
+
+    <!-- عنوان صفحه -->
+    <h1>Quick Start</h1>
+    <p class="qs-sub">Setup your Metal Brain device in 5 steps</p>
+
+    <!-- کارت -->
+    <div class="qs-card">
+
+      <!-- STEP 1 -->
+      <div class="qs-step" id="step1">
+        <h2>Start Configuration</h2>
+        <p>This wizard will guide you through AP, Station and Device setup.</p>
+
+        <button class="btn primary" id="startBtn">Start</button>
+      </div>
+
+      <!-- STEP 2 -->
+      <div class="qs-step" id="step2">
+        <h2>Access Point</h2>
+
+        <div class="qs-field">
+          <label>SSID</label>
+          <input id="apSsid" type="text">
+        </div>
+
+        <div class="qs-field">
+          <label>Password</label>
+          <input id="apPass" type="password">
+        </div>
+
+        <div class="qs-field-inline">
+          <input id="apHidden" type="checkbox">
+          <label for="apHidden">Hidden Network</label>
+        </div>
+
+        <button class="btn primary" id="saveAp">Save</button>
+      </div>
+
+      <!-- STEP 3 -->
+      <div class="qs-step" id="step3">
+        <h2>Station Mode</h2>
+
+        <div class="qs-field-inline">
+          <input id="staHasInternet" type="checkbox">
+          <label for="staHasInternet">I have internet</label>
+        </div>
+
+        <div class="qs-field">
+          <label>Available Networks</label>
+          <select id="staNetworks"></select>
+        </div>
+
+        <div class="qs-field">
+          <label>Password</label>
+          <input id="staPass" type="password">
+        </div>
+
+        <button class="btn primary" id="saveSta">Save</button>
+      </div>
+
+      <!-- STEP 4 -->
+      <div class="qs-step" id="step4">
+        <h2>Select Mode</h2>
+
+        <div class="mode-switch">
+          <label>Access Point</label>
+          <input type="checkbox" id="modeAp">
+        </div>
+
+        <div class="mode-switch">
+          <label>Station</label>
+          <input type="checkbox" id="modeSta">
+        </div>
+
+        <button class="btn primary" id="nextToStep5">Next</button>
+      </div>
+
+      <!-- STEP 5 -->
+      <div class="qs-step" id="step5">
+        <h2>Device Summary</h2>
+        <div id="summaryBox"></div>
+
+        <button class="btn primary" id="finishBtn">Finish</button>
+      </div>
+
+    </div>
+
+    <!-- گام ها -->
+    <div class="qs-dots">
+      <span class="dot active"></span>
+      <span class="dot"></span>
+      <span class="dot"></span>
+      <span class="dot"></span>
+      <span class="dot"></span>
+    </div>
+
+  </div>
+
+  <script src="js/quickstart.js"></script>
+</body>
+</html>
