@@ -4,8 +4,8 @@
 // Title        : Firmware interface header file
 // software     : version 1.0
 // Target MCU   : ESP32 Series
-// Created:     : 04/03/1404
-// Created:     : 25/05/2025
+// Created:     : 16/09/1404
+// Created:     : 7/12/2025
 // Author:      : Yaser Rashnabady
 //
 //******************************************************************************************************
@@ -14,16 +14,12 @@
 //======================================================================================================
 #include <Arduino.h>
 
-#include <CC1101_RFToolkit.h>
-
-#ifdef ESP32
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
-#elif defined(ESP8266)
-#include <ESP8266WiFi.h>
-#include <ESPAsyncTCP.h>
-#endif
+
+#include <ELECHOUSE_CC1101_SRC_DRV.h>
+#include <RCSwitch.h>
 
 // #include <DNSServer.h>
 #include <esp_wifi.h>
@@ -116,7 +112,7 @@ BluetoothSerial SerialBT;
 #define BUTTON_AP__ENABLE true
 #define AP__Button 35
 
-#define BUTTON_STA_ENABLE false
+#define BUTTON_STA_ENABLE true
 #define STA_Button 25
 
 #if WPS_ENABLE
@@ -130,7 +126,7 @@ BluetoothSerial SerialBT;
 #endif
 
 #define DEF_LED_ENABLE true
-#define Def_LED 27
+#define DEF_LED 27
 
 #define AP__LED_ENABLE true
 #define AP__LED 14
@@ -148,7 +144,16 @@ BluetoothSerial SerialBT;
 #define BTH_LED 05
 #endif
 
-#define SERIAL_ENABLE false
+#define CC1101__SCK 18 // ESP32 VSPI SCK
+#define CC1101_MISO 19 // ESP32 VSPI MISO
+#define CC1101_MOSI 23 // ESP32 VSPI MOSI
+#define CC1101___CS 5  // ESP32 VSPI CS
+
+#define CC1101_GDO0 4 // virtual RX pin for RCSwitch
+#define CC1101__RST 15
+#define CC1101_GDO2 2 // virtual TX pin for RCSwitch
+
+#define SERIAL_ENABLE true
 #define Serial_Baudraite 115200
 
 #define OKMESSAGE "Succeed"
@@ -274,6 +279,27 @@ struct BTH_t
 };
 #endif
 
+// ================= USER CONFIG =================
+struct UserConfig_t
+{
+  // --- RF / CC1101 parameters ---
+  float RF_FREQ_MHZ = 315.0f;  // carrier frequency in MHz (e.g. 314.50 or 433.92)
+  uint8_t RF_TX_POWER = 5;     // PA level
+  uint8_t RF_REPEAT_COUNT = 3; // number of repetitions per frame
+
+  // --- Scan band parameters ---
+  float RF_SCAN_START_MHZ = 300.0f; // default scan start (MHz)
+  float RF_SCAN_END_MHZ = 928.0f;   // default scan end   (MHz)
+  float RF_SCAN_STEP_MHZ = 0.25f;   // step size in MHz
+  uint16_t RF_SCAN_DWELL_MS = 50;   // dwell time per step (ms)
+
+  // --- EV1527 code parameters ---
+  uint32_t EV_CODE = 11506981UL;
+  uint8_t EV_BITS = 24;
+  uint32_t EV_DELAY_US = 352;
+  uint8_t EV_PROTOCOL = 1;
+};
+
 struct settings_t
 {
   char DeviceInfo[18];
@@ -288,6 +314,7 @@ struct settings_t
   BTH_t Bluetooth;
 #endif
   char Format_bit;
+  UserConfig_t User;
 };
 
 settings_t settings;
@@ -322,6 +349,32 @@ enum class WiFiModeStatus : uint8_t
   WPS_CONFIG = 0x40,
   BTH_CONFIG = 0x80,
 };
+
+RCSwitch mySwitch;
+// ================= BAND-SCAN STATE MACHINE (non-blocking) =================
+struct ScanSegment
+{
+  float start;
+  float end;
+  int steps;
+};
+
+struct BandScanState
+{
+  bool active = false;
+  bool found = false;
+
+  ScanSegment segments[3];
+  uint8_t segmentsCount = 0;
+
+  uint8_t currentSeg = 0;
+  uint32_t currentStep = 0;
+
+  int bestRssi;
+  float bestFreq;
+};
+
+BandScanState userBandScan;
 //==================================================================================================
 // ----------------------------------------------------------------------------- Auxiliary functions
 //==================================================================================================
@@ -1096,7 +1149,7 @@ void Default()
 #endif
 
 #if DEF_LED_ENABLE
-  digitalWrite(Def_LED, LOW);
+  digitalWrite(DEF_LED, LOW);
 #endif
 
 #if AP__LED_ENABLE
@@ -1142,7 +1195,7 @@ void Config_ST(void)
   WiFi.reconnect();
 
   delay(300);
- // ServerNewHandler();
+  // ServerNewHandler();
 };
 //==================================================================================================
 // ----------------------------- Configure Access Point Mode (SoftAP) ------------------------------
@@ -1173,7 +1226,7 @@ void Config_AP(void)
               settings.AccessPoint.MaxConnection);
 
   delay(300); // بعد از راه‌اندازی هم یه تاخیر کوتاه
-  //ServerNewHandler();
+  // ServerNewHandler();
 };
 //==================================================================================================
 // ---------------------------- Configure Dual Mode (Access Point + Station) ------------------------
@@ -1214,7 +1267,7 @@ void Config_AP_STA(void)
   WiFi.reconnect();
 
   delay(300);
-  //ServerNewHandler();
+  // ServerNewHandler();
 };
 //==================================================================================================
 // --------------------------------- Config Mode Start WPS With PBC --------------------------------
@@ -2382,15 +2435,238 @@ void jsonCmd(void)
   }
 };
 //==================================================================================================
+// ------------------------------------------------------------------------ Auxiliary User functions
+//==================================================================================================
+// ------------ Sends the current EV1527/PT2262 RF code once, then switches CC1101 back to RX mode --------------
+String sendEVCode()
+{
+  String msg;
+  msg.reserve(128);
+
+  msg += "[TX] Sending EV1527 code ";
+  msg += String(settings.User.EV_CODE);
+  msg += " (0x";
+  msg += String(settings.User.EV_CODE, HEX);
+  msg += ", ";
+  msg += String(settings.User.EV_BITS);
+  msg += " bits)";
+  msg += " ... [TX] Done.";
+
+  // --- Switch CC1101 to TX mode temporarily ---
+  ELECHOUSE_cc1101.setMHZ(settings.User.RF_FREQ_MHZ);
+  ELECHOUSE_cc1101.setPA(settings.User.RF_TX_POWER);
+  ELECHOUSE_cc1101.SetTx();
+  mySwitch.enableTransmit(CC1101_GDO0);
+
+  // Send the actual EV1527/PT2262 frame
+  mySwitch.send(settings.User.EV_CODE, settings.User.EV_BITS);
+
+  // --- Immediately return to RX mode after transmit ---
+  ELECHOUSE_cc1101.SetRx();
+  mySwitch.enableReceive(CC1101_GDO0);
+  mySwitch.resetAvailable();
+
+  return msg;
+};
+//==================================================================================================
+// ------------ Initializes CC1101 for OOK RX, builds scan segments, resets state, and starts the band-scan process -----------------
+void beginBandScan(void)
+{
+  // Fixed hardware frequency windows (per board / front-end design)
+  const float hwStart[3] = {300.0f, 387.0f, 779.0f};
+  const float hwEnd[3]   = {348.0f, 464.0f, 928.0f};
+
+  // Reset scan state
+  userBandScan.active       = false;
+  userBandScan.found        = false;
+  userBandScan.segmentsCount = 0;
+  userBandScan.currentSeg   = 0;
+  userBandScan.currentStep  = 0;
+  userBandScan.bestFreq     = 0.0f;
+  userBandScan.bestRssi     = -999;   // very low initial RSSI
+
+  // 1) Configure CC1101 for generic OOK remote reception
+  ELECHOUSE_cc1101.Init();
+  ELECHOUSE_cc1101.setModulation(2);   // 2 = ASK/OOK
+  ELECHOUSE_cc1101.setRxBW(812.5);     // wide RX BW, tolerant for cheap remotes
+  ELECHOUSE_cc1101.setDRate(4.8);      // typical remote data rate in kbps
+  ELECHOUSE_cc1101.setSyncMode(0);     // no sync word detection
+  ELECHOUSE_cc1101.setPktFormat(3);    // infinite RX mode
+  ELECHOUSE_cc1101.setCrc(0);          // no CRC check
+
+  // 2) Build logical scan segments based on user config & hardware bands
+  for (uint8_t i = 0; i < 3; i++)
+  {
+    float segStart = max(settings.User.RF_SCAN_START_MHZ, hwStart[i]);
+    float segEnd   = min(settings.User.RF_SCAN_END_MHZ,   hwEnd[i]);
+
+    if (segStart < segEnd)
+    {
+      ScanSegment &seg = userBandScan.segments[userBandScan.segmentsCount++];
+      seg.start = segStart;
+      seg.end   = segEnd;
+
+      // Number of steps in this segment (inclusive)
+      uint32_t steps = (uint32_t)((segEnd - segStart) / settings.User.RF_SCAN_STEP_MHZ) + 1;
+      if (steps < 1)
+        steps = 1;
+      seg.steps = steps;
+    }
+  }
+
+  // 3) Tune CC1101 to the first segment & enable RX for RCSwitch
+  if (userBandScan.segmentsCount > 0)
+  {
+    ScanSegment &firstSeg = userBandScan.segments[0];
+    ELECHOUSE_cc1101.setMHZ(firstSeg.start);
+    ELECHOUSE_cc1101.SetRx();
+
+    // RCSwitch listens to CC1101 demodulated data on this pin
+    mySwitch.enableReceive(CC1101_GDO0);
+    mySwitch.resetAvailable();
+  }
+
+  // Ready to start scanning via scanBand()
+  userBandScan.active = true;
+};
+//==================================================================================================
+// ------------ Calculates overall scan progress (0–100%) and sends a JSON band_scan.progress status frame. -----------------
+void sendBandScanProgress(float lastFreqMHz)
+{
+  // Total steps across all segments
+  uint32_t totalSteps = 0;
+  for (uint8_t i = 0; i < userBandScan.segmentsCount; i++)
+  {
+    totalSteps += userBandScan.segments[i].steps;
+  }
+
+  // Steps completed so far
+  uint32_t completedSteps = 0;
+  for (uint8_t i = 0; i < userBandScan.currentSeg; i++)
+  {
+    completedSteps += userBandScan.segments[i].steps;
+  }
+  completedSteps += userBandScan.currentStep;
+
+  float progress = 0.0f;
+  if (totalSteps > 0)
+  {
+    if (completedSteps > totalSteps)
+    {
+      completedSteps = totalSteps;
+    }
+    progress = (float)completedSteps * 100.0f / (float)totalSteps;
+  }
+
+  DynamicJsonDocument doc(256);
+  doc["type"]            = "band_scan.progress";
+  doc["progress"]        = progress;                                    // 0–100 (%)
+  doc["lastFrequencyMHz"]= lastFreqMHz;                                 // last tuned frequency
+  doc["segmentNumber"]   = userBandScan.currentSeg + 1;                 // 1-based
+  doc["segmentTotal"]    = userBandScan.segmentsCount;                  // total segments
+  doc["stepSizeKHz"]     = settings.User.RF_SCAN_STEP_MHZ * 1000.0f;    // step size in kHz
+
+  String out;
+  serializeJson(doc, out);
+  notifyClients(out);
+};
+//==================================================================================================
+// ------------ Steps through frequencies, listens for RF frames, reports hits, tracks best RSSI, sends progress, and finally sends user.band_scan.done. -----------------
+void scanBand(void)
+{
+  // If scanning is not active or no segments defined, do nothing
+  if (!userBandScan.active || userBandScan.segmentsCount == 0)
+    return;
+
+  // Current segment
+  ScanSegment &seg = userBandScan.segments[userBandScan.currentSeg];
+
+  float stepMHz = settings.User.RF_SCAN_STEP_MHZ;
+  float freq    = seg.start + userBandScan.currentStep * stepMHz;
+  if (freq > seg.end)
+    freq = seg.end;
+
+  // Tune CC1101 to current frequency
+  ELECHOUSE_cc1101.setMHZ(freq);
+  ELECHOUSE_cc1101.SetRx();
+  mySwitch.resetAvailable();
+
+  // Dwell time at this frequency
+  delay(settings.User.RF_SCAN_DWELL_MS);
+
+  // Measure current RSSI (signal strength)
+  int rssi = ELECHOUSE_cc1101.getRssi();
+
+  // If we have a valid RF frame here, report it and continue scanning
+  if (mySwitch.available())
+  {
+    unsigned long code  = mySwitch.getReceivedValue();
+    unsigned int  bits  = mySwitch.getReceivedBitlength();
+    unsigned int  delayu= mySwitch.getReceivedDelay();
+
+    userBandScan.found = true;
+
+    // Update "best" (strongest) RSSI + frequency
+    if (rssi > userBandScan.bestRssi)
+    {
+      userBandScan.bestRssi = rssi;
+      userBandScan.bestFreq = freq;
+    }
+
+    DynamicJsonDocument res(256);
+    res["type"]     = "user.band_scan.hit";
+    res["freq_MHz"] = freq;
+    res["rssi"]     = rssi;
+    res["code"]     = code;
+    res["bits"]     = bits;
+    res["delay_us"] = delayu;
+
+    String out;
+    serializeJson(res, out);
+    notifyClients(out);
+
+    mySwitch.resetAvailable(); // ready for the next frame
+  }
+
+  // Advance to the next step (next frequency)
+  userBandScan.currentStep++;
+
+  // Send progress update for this step
+  sendBandScanProgress(freq);
+
+  // If we reached the end of this segment
+  if (userBandScan.currentStep >= (uint32_t)seg.steps)
+  {
+    userBandScan.currentSeg++;
+    userBandScan.currentStep = 0;
+
+    // If all segments are done → finish scan
+    if (userBandScan.currentSeg >= userBandScan.segmentsCount)
+    {
+      userBandScan.active = false;
+
+      DynamicJsonDocument done(256);
+      done["type"]             = "user.band_scan.done";
+      done["found"]            = userBandScan.found;
+      done["bestFrequencyMHz"] = userBandScan.bestFreq;
+      done["bestRssi"]         = userBandScan.bestRssi;
+
+      String out;
+      serializeJson(done, out);
+      notifyClients(out);
+      return;
+    }
+  }
+};
+//==================================================================================================
 // -------------------------------- Use User SET interface Json[] ----------------------------------
 bool jsonUserSet(void)
 {
-  uint16_t i = 0;
   bool updated = false;
 
   if (doc["fields"].isNull() || !doc["fields"].is<JsonObject>())
   {
-    sendJsonError("Missing or invalid 'fields' (must be a object)");
+    sendJsonError("Missing or invalid 'fields' (must be an object)");
     return false;
   }
 
@@ -2400,68 +2676,221 @@ bool jsonUserSet(void)
   {
     const char *key = kv.key().c_str();
 
-    //============================ SMS
-    if (strcmp(key, "SMS") == 0)
+    // ============================ RF_FREQ_MHZ (float, 300–928 MHz)
+    if (strcmp(key, "RF_FREQ_MHZ") == 0)
     {
-      if (!kv.value().is<bool>())
+      if (!kv.value().is<float>() && !kv.value().is<double>() && !kv.value().is<int>())
       {
-        sendJsonError("SMS must be boolean (true/false)");
+        sendJsonError("RF_FREQ_MHZ must be a number (MHz)");
         return false;
       }
-      // settings.UserInterface.SMS = kv.value();
+      float mhz = kv.value().as<float>();
+      if (mhz < 300.0f || mhz > 928.0f)
+      {
+        sendJsonError("RF_FREQ_MHZ out of range (300–928 MHz)");
+        return false;
+      }
+      settings.User.RF_FREQ_MHZ = mhz;
       updated = true;
     }
 
-    //============================ THEME (مثلاً: dark یا light)
-    else if (strcmp(key, "Theme") == 0)
+    // ============================ RF_SCAN_START_MHZ (float, 300–928 MHz)
+    else if (strcmp(key, "RF_SCAN_START_MHZ") == 0)
     {
-      const char *val = kv.value();
-      if (strlen(val) == 0 || strlen(val) > 10)
+      if (!kv.value().is<float>() && !kv.value().is<double>() && !kv.value().is<int>())
       {
-        sendJsonError("Theme must be a short non-empty string");
+        sendJsonError("RF_SCAN_START_MHZ must be a number (MHz)");
         return false;
       }
-      // strlcpy(settings.UserInterface.Theme, val, sizeof(settings.UserInterface.Theme));
+      float v = kv.value().as<float>();
+      if (v < 300.0f || v > 928.0f)
+      {
+        sendJsonError("RF_SCAN_START_MHZ out of range (300–928 MHz)");
+        return false;
+      }
+      settings.User.RF_SCAN_START_MHZ = v;
       updated = true;
     }
 
-    //============================ LANGUAGE
-    else if (strcmp(key, "Language") == 0)
+    // ============================ RF_SCAN_END_MHZ (float, 300–928 MHz)
+    else if (strcmp(key, "RF_SCAN_END_MHZ") == 0)
     {
-      const char *val = kv.value();
-      if (strlen(val) == 0 || strlen(val) > 5)
+      if (!kv.value().is<float>() && !kv.value().is<double>() && !kv.value().is<int>())
       {
-        sendJsonError("Language must be a valid short code (e.g., en, fa)");
+        sendJsonError("RF_SCAN_END_MHZ must be a number (MHz)");
         return false;
       }
-      // strlcpy(settings.UserInterface.Language, val, sizeof(settings.UserInterface.Language));
+      float v = kv.value().as<float>();
+      if (v < 300.0f || v > 928.0f)
+      {
+        sendJsonError("RF_SCAN_END_MHZ out of range (300–928 MHz)");
+        return false;
+      }
+      settings.User.RF_SCAN_END_MHZ = v;
       updated = true;
     }
 
-    //============================ UNKNOWN
+    // ============================ RF_SCAN_STEP_MHZ (float, 0.05–10 MHz)
+    else if (strcmp(key, "RF_SCAN_STEP_MHZ") == 0)
+    {
+      if (!kv.value().is<float>() && !kv.value().is<double>() && !kv.value().is<int>())
+      {
+        sendJsonError("RF_SCAN_STEP_MHZ must be a number (MHz)");
+        return false;
+      }
+      float v = kv.value().as<float>();
+      if (v < 0.05f || v > 10.0f)
+      {
+        sendJsonError("RF_SCAN_STEP_MHZ out of range (0.05–10 MHz)");
+        return false;
+      }
+      settings.User.RF_SCAN_STEP_MHZ = v;
+      updated = true;
+    }
+
+    // ============================ RF_SCAN_DWELL_MS (uint16_t, 1–5000 ms)
+    else if (strcmp(key, "RF_SCAN_DWELL_MS") == 0)
+    {
+      if (!kv.value().is<int>())
+      {
+        sendJsonError("RF_SCAN_DWELL_MS must be integer (milliseconds)");
+        return false;
+      }
+      int v = kv.value().as<int>();
+      if (v < 1 || v > 5000)
+      {
+        sendJsonError("RF_SCAN_DWELL_MS out of range (1–5000 ms)");
+        return false;
+      }
+      settings.User.RF_SCAN_DWELL_MS = (uint16_t)v;
+      updated = true;
+    }
+
+    // ============================ RF_TX_POWER (uint8_t, 0–10 توصیه)
+    else if (strcmp(key, "RF_TX_POWER") == 0)
+    {
+      if (!kv.value().is<int>())
+      {
+        sendJsonError("RF_TX_POWER must be integer");
+        return false;
+      }
+      int p = kv.value().as<int>();
+      if (p < 0 || p > 10)
+      {
+        sendJsonError("RF_TX_POWER out of range (0–10)");
+        return false;
+      }
+      settings.User.RF_TX_POWER = (uint8_t)p;
+      updated = true;
+    }
+
+    // ============================ RF_REPEAT_COUNT (uint8_t)
+    else if (strcmp(key, "RF_REPEAT_COUNT") == 0)
+    {
+      if (!kv.value().is<int>())
+      {
+        sendJsonError("RF_REPEAT_COUNT must be integer");
+        return false;
+      }
+      int r = kv.value().as<int>();
+      if (r < 1 || r > 50)
+      {
+        sendJsonError("RF_REPEAT_COUNT out of range (1–50)");
+        return false;
+      }
+      settings.User.RF_REPEAT_COUNT = (uint8_t)r;
+      updated = true;
+    }
+
+    // ============================ EV_CODE (uint32_t)
+    else if (strcmp(key, "EV_CODE") == 0)
+    {
+      if (!kv.value().is<unsigned long>() && !kv.value().is<uint32_t>() && !kv.value().is<int>())
+      {
+        sendJsonError("EV_CODE must be unsigned integer");
+        return false;
+      }
+      uint32_t code = kv.value().as<uint32_t>();
+      settings.User.EV_CODE = code;
+      updated = true;
+    }
+
+    // ============================ EV_BITS (uint8_t)
+    else if (strcmp(key, "EV_BITS") == 0)
+    {
+      if (!kv.value().is<int>())
+      {
+        sendJsonError("EV_BITS must be integer");
+        return false;
+      }
+      int b = kv.value().as<int>();
+      if (b < 1 || b > 32)
+      {
+        sendJsonError("EV_BITS out of range (1–32)");
+        return false;
+      }
+      settings.User.EV_BITS = (uint8_t)b;
+      updated = true;
+    }
+
+    // ============================ EV_DELAY_US (uint32_t)
+    else if (strcmp(key, "EV_DELAY_US") == 0)
+    {
+      if (!kv.value().is<unsigned long>() && !kv.value().is<uint32_t>() && !kv.value().is<int>())
+      {
+        sendJsonError("EV_DELAY_US must be unsigned integer (microseconds)");
+        return false;
+      }
+      uint32_t d = kv.value().as<uint32_t>();
+      if (d < 50 || d > 5000)
+      {
+        sendJsonError("EV_DELAY_US out of range (50–5000 us)");
+        return false;
+      }
+      settings.User.EV_DELAY_US = d;
+      updated = true;
+    }
+
+    // ============================ EV_PROTOCOL (uint8_t)
+    else if (strcmp(key, "EV_PROTOCOL") == 0)
+    {
+      if (!kv.value().is<int>())
+      {
+        sendJsonError("EV_PROTOCOL must be integer");
+        return false;
+      }
+      int pr = kv.value().as<int>();
+      if (pr < 1 || pr > 10)
+      {
+        sendJsonError("EV_PROTOCOL out of range (1–10)");
+        return false;
+      }
+      settings.User.EV_PROTOCOL = (uint8_t)pr;
+      updated = true;
+    }
+
+    // ============================ Unknown user field
     else
     {
-      sendJsonError((String("Unknown user fields: ") + key).c_str());
+      sendJsonError((String("Unknown user field: ") + key).c_str());
       return false;
     }
   }
 
   if (updated)
   {
-    // storage.write();
-    sendJsonStatus("User settings saved");
+    storage.write();
+    return true;
   }
-  else
-  {
-    sendJsonError("No valid fields to update");
-  }
-  return true;
-};
+
+  sendJsonError("No valid user fields to update");
+  return false;
+}
 //==================================================================================================
 // -------------------------------- Use User GET interface Json[] ----------------------------------
 void jsonUserGet(void)
 {
-  // storage.read();
+  storage.read();
   res.clear();
 
   if (doc["fields"].isNull() || !doc["fields"].is<JsonArray>())
@@ -2471,29 +2900,121 @@ void jsonUserGet(void)
   }
 
   JsonArray fields = doc["fields"].as<JsonArray>();
+
   for (JsonVariant f : fields)
   {
     const char *field = f.as<const char *>();
 
-    if (strcmp(field, "SMS") == 0)
-    {
-      // res["SMS"] = settings.UserInterface.SMS;
-    }
+    if (strcmp(field, "RF_FREQ_MHZ") == 0)
+      res["RF_FREQ_MHZ"] = settings.User.RF_FREQ_MHZ;
+
+    else if (strcmp(field, "RF_TX_POWER") == 0)
+      res["RF_TX_POWER"] = settings.User.RF_TX_POWER;
+
+    else if (strcmp(field, "RF_REPEAT_COUNT") == 0)
+      res["RF_REPEAT_COUNT"] = settings.User.RF_REPEAT_COUNT;
+
+    else if (strcmp(field, "EV_CODE") == 0)
+      res["EV_CODE"] = settings.User.EV_CODE;
+
+    else if (strcmp(field, "EV_BITS") == 0)
+      res["EV_BITS"] = settings.User.EV_BITS;
+
+    else if (strcmp(field, "EV_DELAY_US") == 0)
+      res["EV_DELAY_US"] = settings.User.EV_DELAY_US;
+
+    else if (strcmp(field, "EV_PROTOCOL") == 0)
+      res["EV_PROTOCOL"] = settings.User.EV_PROTOCOL;
+
+    else if (strcmp(field, "RF_SCAN_START_MHZ") == 0)
+      res["RF_SCAN_START_MHZ"] = settings.User.RF_SCAN_START_MHZ;
+
+    else if (strcmp(field, "RF_SCAN_END_MHZ") == 0)
+      res["RF_SCAN_END_MHZ"] = settings.User.RF_SCAN_END_MHZ;
+
+    else if (strcmp(field, "RF_SCAN_STEP_MHZ") == 0)
+      res["RF_SCAN_STEP_MHZ"] = settings.User.RF_SCAN_STEP_MHZ;
+
+    else if (strcmp(field, "RF_SCAN_DWELL_MS") == 0)
+      res["RF_SCAN_DWELL_MS"] = settings.User.RF_SCAN_DWELL_MS;
+
     else
-    {
-      res[field] = "Unknown user fields";
-    }
+      res[field] = "Unknown user field";
   }
 
   String out;
   serializeJson(res, out);
   notifyClients(out);
-};
+}
 //==================================================================================================
 // -------------------------------- Use User CMD interface Json[] ----------------------------------
 void jsonUserCMD(void)
 {
-  sendJsonError("User CMD not implemented");
+  if (doc["fields"].isNull() || !doc["fields"].is<JsonObject>())
+  {
+    sendJsonError("Missing or invalid 'fields' (must be an object)");
+    return;
+  }
+
+  JsonObject f = doc["fields"].as<JsonObject>();
+  bool handled = false;
+
+  for (JsonPair kv : f)
+  {
+    const char *key = kv.key().c_str();
+
+    // ----------------------------------------------------------
+    // Command: Send EV Code once (using current User settings)
+    // ----------------------------------------------------------
+    if (strcmp(key, "Send EV Code") == 0)
+    {
+      if (!kv.value().is<bool>() || kv.value().isNull() || kv.value().as<bool>() != true)
+      {
+        sendJsonError("Send EV Code must be boolean true");
+        return;
+      }
+
+      String txMsg = sendEVCode();
+      sendJsonStatus(txMsg.c_str());
+      handled = true;
+    }
+
+    // ----------------------------------------------------------
+    // Command: Scan Band  (trigger only – params از UserConfig)
+    // ----------------------------------------------------------
+    else if (strcmp(key, "Scan Band") == 0)
+    {
+      if (!kv.value().is<bool>() || kv.value().isNull() || kv.value().as<bool>() != true)
+      {
+        sendJsonError("Scan Band must be boolean true");
+        return;
+      }
+
+      if (userBandScan.active)
+      {
+        sendJsonError("Band scan already running");
+        return;
+      }
+      beginBandScan();
+
+      sendJsonStatus("Band scan requested");
+      handled = true;
+    }
+
+    // ----------------------------------------------------------
+    // Unknown command
+    // ----------------------------------------------------------
+    else
+    {
+      sendJsonError((String("Unknown user command: ") + key).c_str());
+      return;
+    }
+  }
+
+  if (!handled)
+  {
+    sendJsonError("No valid user command");
+  }
 };
 //==================================================================================================
 // ----------------------------------- Use Process Json Message ------------------------------------
@@ -2552,6 +3073,10 @@ void processJsonMessage(JsonDocument &doc)
       }
       if (jsonUserSet())
         sendJsonStatus("User settings saved");
+    }
+    else if (strcmp(action, "command") == 0)
+    {
+      jsonUserCMD();
     }
     else
     {
@@ -2644,7 +3169,7 @@ void setup()
   WiFi.mode(WIFI_OFF);
   //----------------------------------------- initialize digital pin LED output.
 #if DEF_LED_ENABLE
-  pinMode(Def_LED, OUTPUT);
+  pinMode(DEF_LED, OUTPUT);
 #endif
 
 #if STA_LED_ENABLE
@@ -2693,7 +3218,67 @@ void setup()
   Serial.println();
   Serial.println("Device start...");
 #endif
-  digitalWrite(Def_LED, HIGH);
+  digitalWrite(DEF_LED, HIGH);
+  //----------------------------------------- Initialize SPI for CC1101
+  ELECHOUSE_cc1101.setSpiPin(CC1101__SCK, CC1101_MISO, CC1101_MOSI, CC1101___CS);
+#if SERIAL_ENABLE
+  if (ELECHOUSE_cc1101.getCC1101())
+  {
+    Serial.println(F("CC1101 SPI connection OK"));
+  }
+  else
+  {
+    Serial.println(F("ERROR: CC1101 SPI connection failed! Check wiring."));
+    while (true)
+    {
+      delay(1000);
+    }
+  }
+#endif
+  if (!ELECHOUSE_cc1101.getCC1101())
+    while (true)
+      delay(1000);
+
+  // === Configure CC1101 for default RX (always listening) ===
+  ELECHOUSE_cc1101.Init();           // حتماً اول
+  ELECHOUSE_cc1101.setModulation(2); // ASK/OOK
+  ELECHOUSE_cc1101.setRxBW(812.5);   // یا فعلاً 812.5 برای دیباگ
+  ELECHOUSE_cc1101.setDRate(4.8);    // بیت‌ریت معمول ریموت‌ها
+  ELECHOUSE_cc1101.setSyncMode(0);   // بدون سینک‌ورد
+  ELECHOUSE_cc1101.setPktFormat(3);  // حالت RX بی‌نهایت
+  ELECHOUSE_cc1101.setCrc(0);        // بدون CRC
+  ELECHOUSE_cc1101.setMHZ(settings.User.RF_FREQ_MHZ);
+  ELECHOUSE_cc1101.SetRx(); // ⬅️ همیشه بعد بوت در حالت گیرنده
+
+  // === Configure Rc-Switch RX path ===
+  mySwitch.enableReceive(CC1101_GDO0); // پین RX
+  mySwitch.resetAvailable();
+
+  // === پارامترهای مشترک EV1527 (برای TX/RX یکسانند) ===
+  mySwitch.setProtocol(settings.User.EV_PROTOCOL);
+  mySwitch.setPulseLength(settings.User.EV_DELAY_US);
+  mySwitch.setRepeatTransmit(settings.User.RF_REPEAT_COUNT);
+
+#if SERIAL_ENABLE
+  Serial.print(F("Using frequency: "));
+  Serial.print(settings.User.RF_FREQ_MHZ, 2);
+  Serial.println(F(" MHz"));
+
+  Serial.print(F("EV code: "));
+  Serial.print(settings.User.EV_CODE);
+  Serial.print(F(" (0x"));
+  Serial.print(settings.User.EV_CODE, HEX);
+  Serial.print(F(", "));
+  Serial.print(settings.User.EV_BITS);
+  Serial.println(F(" bits)"));
+
+  Serial.print(F("Pulse length: "));
+  Serial.print(settings.User.EV_DELAY_US);
+  Serial.println(F(" us"));
+
+  Serial.println(F("Ready. Sending every 1 second..."));
+#endif
+
 //----------------------------------------- Initialize SPIFFS
 #if SERIAL_ENABLE
   if (!SPIFFS.begin(true))
@@ -2795,4 +3380,6 @@ void loop()
 #if OTA_ENABLE
   ElegantOTA.loop();
 #endif
+
+  scanBand();
 };

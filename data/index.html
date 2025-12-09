@@ -42,6 +42,8 @@
                 minlength="1"
                 maxlength="16"
                 required
+                autocomplete="username"
+                aria-describedby="loginError"
                 placeholder="Device user">
             </div>
           </div>
@@ -58,13 +60,25 @@
                 minlength="1"
                 maxlength="16"
                 required
+                autocomplete="current-password"
+                aria-describedby="loginError"
                 placeholder="Device password">
-              <button type="button" class="right-btn" id="togglePwd">👁</button>
+              <button
+                type="button"
+                class="right-btn"
+                id="togglePwd"
+                aria-label="Toggle password visibility"
+                aria-pressed="false"
+                title="Show password">👁</button>
             </div>
           </div>
 
           <!-- خطاها -->
-          <p id="loginError" class="error-msg"></p>
+          <p id="loginError" class="error-msg" aria-live="polite"></p>
+
+          <noscript>
+            <p class="error-msg">JavaScript is required to use this login form.</p>
+          </noscript>
 
           <!-- دکمه لاگین -->
           <div class="login-footer">
