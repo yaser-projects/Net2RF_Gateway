@@ -101,6 +101,7 @@ BluetoothSerial SerialBT;
 #define WIFIINFO 3
 #define WIFISSID 0
 #define WIFIRSSI 1
+#define WIFI_MIN_RSSI -110
 #define WIFIENCRYPTION 2
 
 #define DEBOUNCE 50
@@ -322,6 +323,7 @@ EEPROMStorage storage;
 DynamicJsonDocument doc(1028);
 DynamicJsonDocument res(1028);
 
+bool wifiScanBusy = false;
 String scanArray[WIFIINFO * SCANSIZE];
 uint8_t scanSize;
 
@@ -351,6 +353,7 @@ enum class WiFiModeStatus : uint8_t
 };
 
 RCSwitch mySwitch;
+#define MAX_HITS 8
 // ================= BAND-SCAN STATE MACHINE (non-blocking) =================
 struct ScanSegment
 {
@@ -359,19 +362,27 @@ struct ScanSegment
   int steps;
 };
 
+// Best result for a single remote (unique RF code)
+struct BandScanHit
+{
+  bool used = false;
+  uint32_t code = 0;
+  uint8_t bits = 0;
+  uint32_t delayUs = 0;
+  float bestFreq = 0.0f;
+  int bestRssi = -999;
+};
+
 struct BandScanState
 {
   bool active = false;
   bool found = false;
-
   ScanSegment segments[3];
   uint8_t segmentsCount = 0;
-
   uint8_t currentSeg = 0;
   uint32_t currentStep = 0;
-
-  int bestRssi;
-  float bestFreq;
+  BandScanHit hits[MAX_HITS];
+  uint8_t hitsCount = 0;
 };
 
 BandScanState userBandScan;
@@ -1696,11 +1707,17 @@ void handleBluetoothButton(Button2 &btn)
 #endif
 //==================================================================================================
 // -------------------------------------- Use Scan Networks ----------------------------------------
-bool scanNetworks(void)
+void scanNetworks(void)
 {
+  if (!wifiScanBusy)
+    return;
+
+  wifiScanBusy = true;
+
   wifi_mode_t previousMode = WiFi.getMode();
   bool restoreMode = false;
 
+  // برای اسکن بهتر، موقتاً روی WIFI_AP_STA برو
   if (previousMode != WIFI_AP_STA)
   {
     WiFi.mode(WIFI_AP_STA);
@@ -1708,9 +1725,10 @@ bool scanNetworks(void)
     restoreMode = true;
   }
 
+  // اسکن شبکه‌ها
   scanSize = WiFi.scanNetworks();
-  if (scanSize <= 0)
-    return false;
+  if (scanSize < 0)
+    scanSize = 0;
 
   uint8_t count = 0;
   for (int i = 0; i < scanSize && count < SCANSIZE; i++)
@@ -1718,11 +1736,11 @@ bool scanNetworks(void)
     int rssi = WiFi.RSSI(i);
     String ssid = WiFi.SSID(i);
 
-    // حذف SSID خالی و RSSI ضعیف
-    if (ssid.length() == 0 || rssi < -90)
+    // حذف SSID خالی و سیگنال خیلی ضعیف
+    if (ssid.length() == 0 || rssi < WIFI_MIN_RSSI)
       continue;
 
-    // بررسی تکراری بودن SSID
+    // حذف SSID تکراری (قوی‌ترین RSSI نگه داشته می‌شود)
     bool duplicate = false;
     for (int j = 0; j < count; j++)
     {
@@ -1737,26 +1755,52 @@ bool scanNetworks(void)
         break;
       }
     }
-
     if (duplicate)
       continue;
 
+    // ثبت شبکه جدید
     scanArray[(count * WIFIINFO) + WIFISSID] = ssid;
     scanArray[(count * WIFIINFO) + WIFIRSSI] = String(rssi);
     scanArray[(count * WIFIINFO) + WIFIENCRYPTION] =
         (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "OPEN" : "SECURED";
+
     count++;
   }
 
   scanSize = count;
 
+  // بازگرداندن مود قبلی WiFi
   if (restoreMode)
   {
     WiFi.mode(previousMode);
     delay(100);
   }
 
-  return (scanSize > 0);
+  DynamicJsonDocument resp(768);
+
+  if (scanSize > 0)
+  {
+    // {"Scan Networks": [ [ssid, rssi, encryption], ... ] }
+    JsonArray scanArrayJson = resp.createNestedArray("Scan Networks");
+
+    for (uint8_t idx = 0; idx < scanSize; idx++)
+    {
+      JsonArray item = scanArrayJson.createNestedArray();
+      item.add(scanArray[(idx * WIFIINFO) + WIFISSID]);       // ssid
+      item.add(scanArray[(idx * WIFIINFO) + WIFIRSSI]);       // rssi
+      item.add(scanArray[(idx * WIFIINFO) + WIFIENCRYPTION]); // encryption
+    }
+  }
+  else
+  {
+    resp["Scan Networks"] = "No Wi-Fi networks found";
+  }
+
+  wifiScanBusy = false;
+
+  String out;
+  serializeJson(resp, out);
+  notifyClients(out);
 };
 //==================================================================================================
 // ------------------------------------- Use Send Json Error ---------------------------------------
@@ -2240,24 +2284,6 @@ void jsonGet(void)
         res["Modem WPS PIN"] = settings.Station.WPS_PIN;
       }
 #endif
-      else if (strcmp(field, "Scan Networks") == 0)
-      {
-        if (scanNetworks())
-        {
-          JsonArray scanArrayJson = res.createNestedArray("Scan Networks");
-          for (uint8_t i = 0; i < scanSize; i++)
-          {
-            JsonArray item = scanArrayJson.createNestedArray();
-            item.add(scanArray[(i * WIFIINFO) + WIFISSID]);
-            item.add(scanArray[(i * WIFIINFO) + WIFIRSSI]);
-            item.add(scanArray[(i * WIFIINFO) + WIFIENCRYPTION]);
-          }
-        }
-        else
-        {
-          res["Scan Networks"] = "No Wi-Fi networks found";
-        }
-      }
       //=========================================================================
       //=============================================================== Bluetooth
       //=========================================================================
@@ -2372,6 +2398,9 @@ void jsonCmd(void)
   for (JsonPair kv : f)
   {
     const char *key = kv.key().c_str();
+
+    //=========================================================================
+    // Reset factory
     //=========================================================================
     if (strcmp(key, "Reset factory") == 0)
     {
@@ -2383,6 +2412,8 @@ void jsonCmd(void)
       sendJsonStatus(OKMESSAGE);
       Default();
     }
+    //=========================================================================
+    // Reset device (ESP.restart)
     //=========================================================================
     else if (strcmp(key, "Reset device") == 0)
     {
@@ -2396,6 +2427,8 @@ void jsonCmd(void)
       ESP.restart();
     }
     //=========================================================================
+    // AP Button → Cmd_Config_AP()
+    //=========================================================================
     else if (strcmp(key, "AP Button") == 0)
     {
       if (!kv.value().is<bool>() || kv.value().isNull() || kv.value().as<bool>() != true)
@@ -2407,16 +2440,41 @@ void jsonCmd(void)
       Cmd_Config_AP();
     }
     //=========================================================================
+    // STA Button → Cmd_Config_STA()
+    //=========================================================================
     else if (strcmp(key, "STA Button") == 0)
     {
       if (!kv.value().is<bool>() || kv.value().isNull() || kv.value().as<bool>() != true)
       {
-        sendJsonError("AP Button must be boolean true");
+        // (باگ قبلی: متن ارور نوشته بود AP Button؛ اصلاح شد به STA Button)
+        sendJsonError("STA Button must be boolean true");
         return;
       }
       sendJsonStatus(OKMESSAGE);
       Cmd_Config_STA();
     }
+    //=========================================================================
+    // Scan Networks (WiFi scan command با فلگ busy)
+    //=========================================================================
+    else if (strcmp(key, "Scan Networks") == 0)
+    {
+      if (!kv.value().is<bool>() || kv.value().isNull() || kv.value().as<bool>() != true)
+      {
+        sendJsonError("Scan Networks must be boolean true");
+        return;
+      }
+
+      if (wifiScanBusy)
+      {
+        sendJsonError("WiFi scan busy");
+        return;
+      }
+      wifiScanBusy = true;
+
+      sendJsonStatus(OKMESSAGE);
+    }
+    //=========================================================================
+    // Config → Config()
     //=========================================================================
     else if (strcmp(key, "Config") == 0)
     {
@@ -2428,6 +2486,9 @@ void jsonCmd(void)
       sendJsonStatus(OKMESSAGE);
       Config();
     }
+    //=========================================================================
+    // Unknown command
+    //=========================================================================
     else
     {
       sendJsonError((String("Unknown command: ") + key).c_str());
@@ -2437,7 +2498,7 @@ void jsonCmd(void)
 //==================================================================================================
 // ------------------------------------------------------------------------ Auxiliary User functions
 //==================================================================================================
-// ------------ Sends the current EV1527/PT2262 RF code once, then switches CC1101 back to RX mode --------------
+// -------- Sends the current EV1527/PT2262 RF code, then switches CC1101 back to RX mode ----------
 String sendEVCode()
 {
   String msg;
@@ -2469,44 +2530,51 @@ String sendEVCode()
   return msg;
 };
 //==================================================================================================
-// ------------ Initializes CC1101 for OOK RX, builds scan segments, resets state, and starts the band-scan process -----------------
+// -- Initializes CC1101 for RX, builds scan segments, resets state, and starts the band-scan process --
 void beginBandScan(void)
 {
-  // Fixed hardware frequency windows (per board / front-end design)
   const float hwStart[3] = {300.0f, 387.0f, 779.0f};
-  const float hwEnd[3]   = {348.0f, 464.0f, 928.0f};
+  const float hwEnd[3] = {348.0f, 464.0f, 928.0f};
 
   // Reset scan state
-  userBandScan.active       = false;
-  userBandScan.found        = false;
+  userBandScan.active = false;
+  userBandScan.found = false;
   userBandScan.segmentsCount = 0;
-  userBandScan.currentSeg   = 0;
-  userBandScan.currentStep  = 0;
-  userBandScan.bestFreq     = 0.0f;
-  userBandScan.bestRssi     = -999;   // very low initial RSSI
+  userBandScan.currentSeg = 0;
+  userBandScan.currentStep = 0;
 
-  // 1) Configure CC1101 for generic OOK remote reception
+  userBandScan.hitsCount = 0;
+  for (uint8_t i = 0; i < MAX_HITS; i++)
+  {
+    userBandScan.hits[i].used = false;
+    userBandScan.hits[i].code = 0;
+    userBandScan.hits[i].bits = 0;
+    userBandScan.hits[i].delayUs = 0;
+    userBandScan.hits[i].bestFreq = 0.0f;
+    userBandScan.hits[i].bestRssi = -999;
+  }
+
+  // 1) CC1101 RX config for OOK remotes
   ELECHOUSE_cc1101.Init();
-  ELECHOUSE_cc1101.setModulation(2);   // 2 = ASK/OOK
-  ELECHOUSE_cc1101.setRxBW(812.5);     // wide RX BW, tolerant for cheap remotes
-  ELECHOUSE_cc1101.setDRate(4.8);      // typical remote data rate in kbps
-  ELECHOUSE_cc1101.setSyncMode(0);     // no sync word detection
-  ELECHOUSE_cc1101.setPktFormat(3);    // infinite RX mode
-  ELECHOUSE_cc1101.setCrc(0);          // no CRC check
+  ELECHOUSE_cc1101.setModulation(2); // ASK/OOK
+  ELECHOUSE_cc1101.setRxBW(812.5);
+  ELECHOUSE_cc1101.setDRate(4.8);
+  ELECHOUSE_cc1101.setSyncMode(0);
+  ELECHOUSE_cc1101.setPktFormat(3);
+  ELECHOUSE_cc1101.setCrc(0);
 
-  // 2) Build logical scan segments based on user config & hardware bands
+  // 2) Build dynamic segments
   for (uint8_t i = 0; i < 3; i++)
   {
     float segStart = max(settings.User.RF_SCAN_START_MHZ, hwStart[i]);
-    float segEnd   = min(settings.User.RF_SCAN_END_MHZ,   hwEnd[i]);
+    float segEnd = min(settings.User.RF_SCAN_END_MHZ, hwEnd[i]);
 
     if (segStart < segEnd)
     {
       ScanSegment &seg = userBandScan.segments[userBandScan.segmentsCount++];
       seg.start = segStart;
-      seg.end   = segEnd;
+      seg.end = segEnd;
 
-      // Number of steps in this segment (inclusive)
       uint32_t steps = (uint32_t)((segEnd - segStart) / settings.User.RF_SCAN_STEP_MHZ) + 1;
       if (steps < 1)
         steps = 1;
@@ -2514,23 +2582,20 @@ void beginBandScan(void)
     }
   }
 
-  // 3) Tune CC1101 to the first segment & enable RX for RCSwitch
+  // 3) Tune to first segment and enter RX
   if (userBandScan.segmentsCount > 0)
   {
     ScanSegment &firstSeg = userBandScan.segments[0];
     ELECHOUSE_cc1101.setMHZ(firstSeg.start);
     ELECHOUSE_cc1101.SetRx();
-
-    // RCSwitch listens to CC1101 demodulated data on this pin
-    mySwitch.enableReceive(CC1101_GDO0);
     mySwitch.resetAvailable();
+    // اگر لازم داری: mySwitch.enableReceive(CC1101_GDO0); رو همینجا صدا بزن
   }
 
-  // Ready to start scanning via scanBand()
   userBandScan.active = true;
 };
 //==================================================================================================
-// ------------ Calculates overall scan progress (0–100%) and sends a JSON band_scan.progress status frame. -----------------
+// -- Calculates overall scan progress (0–100%) and sends a JSON band_scan.progress status frame ---
 void sendBandScanProgress(float lastFreqMHz)
 {
   // Total steps across all segments
@@ -2559,22 +2624,22 @@ void sendBandScanProgress(float lastFreqMHz)
   }
 
   DynamicJsonDocument doc(256);
-  doc["type"]            = "band_scan.progress";
-  doc["progress"]        = progress;                                    // 0–100 (%)
-  doc["lastFrequencyMHz"]= lastFreqMHz;                                 // last tuned frequency
-  doc["segmentNumber"]   = userBandScan.currentSeg + 1;                 // 1-based
-  doc["segmentTotal"]    = userBandScan.segmentsCount;                  // total segments
-  doc["stepSizeKHz"]     = settings.User.RF_SCAN_STEP_MHZ * 1000.0f;    // step size in kHz
+  doc["type"] = "band_scan.progress";
+  doc["progress"] = progress;                                    // 0–100 (%)
+  doc["lastFrequencyMHz"] = lastFreqMHz;                         // last tuned frequency
+  doc["segmentNumber"] = userBandScan.currentSeg + 1;            // 1-based
+  doc["segmentTotal"] = userBandScan.segmentsCount;              // total segments
+  doc["stepSizeKHz"] = settings.User.RF_SCAN_STEP_MHZ * 1000.0f; // step size in kHz
 
   String out;
   serializeJson(doc, out);
   notifyClients(out);
 };
 //==================================================================================================
-// ------------ Steps through frequencies, listens for RF frames, reports hits, tracks best RSSI, sends progress, and finally sends user.band_scan.done. -----------------
+// --- Steps through frequencies, listens for RF frames, reports hits, tracks best RSSI, sends progress, and finally sends user.band_scan.done ---
 void scanBand(void)
 {
-  // If scanning is not active or no segments defined, do nothing
+  // If scan not active or no segments, do nothing
   if (!userBandScan.active || userBandScan.segmentsCount == 0)
     return;
 
@@ -2582,79 +2647,114 @@ void scanBand(void)
   ScanSegment &seg = userBandScan.segments[userBandScan.currentSeg];
 
   float stepMHz = settings.User.RF_SCAN_STEP_MHZ;
-  float freq    = seg.start + userBandScan.currentStep * stepMHz;
+  float freq = seg.start + userBandScan.currentStep * stepMHz;
   if (freq > seg.end)
     freq = seg.end;
 
-  // Tune CC1101 to current frequency
+  // Tune to current frequency and listen
   ELECHOUSE_cc1101.setMHZ(freq);
   ELECHOUSE_cc1101.SetRx();
   mySwitch.resetAvailable();
 
-  // Dwell time at this frequency
   delay(settings.User.RF_SCAN_DWELL_MS);
 
-  // Measure current RSSI (signal strength)
-  int rssi = ELECHOUSE_cc1101.getRssi();
-
-  // If we have a valid RF frame here, report it and continue scanning
+  // If a frame is received on this frequency
   if (mySwitch.available())
   {
-    unsigned long code  = mySwitch.getReceivedValue();
-    unsigned int  bits  = mySwitch.getReceivedBitlength();
-    unsigned int  delayu= mySwitch.getReceivedDelay();
+    unsigned long code = mySwitch.getReceivedValue();
+    unsigned int bits = mySwitch.getReceivedBitlength();
+    unsigned int delayu = mySwitch.getReceivedDelay();
 
     userBandScan.found = true;
 
-    // Update "best" (strongest) RSSI + frequency
-    if (rssi > userBandScan.bestRssi)
+    // Measure RSSI at this frequency
+    int rssi = ELECHOUSE_cc1101.getRssi();
+
+    // --- 1) Send lightweight "found" message immediately ---
     {
-      userBandScan.bestRssi = rssi;
-      userBandScan.bestFreq = freq;
+      DynamicJsonDocument foundDoc(128);
+      foundDoc["type"] = "user.band_scan.found";
+      foundDoc["freq_MHz"] = freq;
+
+      String out;
+      serializeJson(foundDoc, out);
+      notifyClients(out);
     }
 
-    DynamicJsonDocument res(256);
-    res["type"]     = "user.band_scan.hit";
-    res["freq_MHz"] = freq;
-    res["rssi"]     = rssi;
-    res["code"]     = code;
-    res["bits"]     = bits;
-    res["delay_us"] = delayu;
+    // --- 2) Update best-per-code table ---
+    int idx = -1;
+    for (uint8_t i = 0; i < userBandScan.hitsCount; i++)
+    {
+      if (userBandScan.hits[i].used && userBandScan.hits[i].code == code)
+      {
+        idx = i;
+        break;
+      }
+    }
 
-    String out;
-    serializeJson(res, out);
-    notifyClients(out);
+    // New code (new remote)?
+    if (idx == -1 && userBandScan.hitsCount < MAX_HITS)
+    {
+      idx = userBandScan.hitsCount++;
+    }
 
-    mySwitch.resetAvailable(); // ready for the next frame
+    if (idx != -1)
+    {
+      BandScanHit &h = userBandScan.hits[idx];
+
+      // اگر اولین بار است یا این فرکانس قوی‌تر است، به‌روزرسانی کن
+      if (!h.used || rssi > h.bestRssi)
+      {
+        h.used = true;
+        h.code = code;
+        h.bits = bits;
+        h.delayUs = delayu;
+        h.bestFreq = freq;
+        h.bestRssi = rssi;
+      }
+    }
+
+    mySwitch.resetAvailable();
   }
 
-  // Advance to the next step (next frequency)
+  // Advance to next step
   userBandScan.currentStep++;
 
-  // Send progress update for this step
+  // Progress update
   sendBandScanProgress(freq);
 
-  // If we reached the end of this segment
+  // End of this segment?
   if (userBandScan.currentStep >= (uint32_t)seg.steps)
   {
     userBandScan.currentSeg++;
     userBandScan.currentStep = 0;
 
-    // If all segments are done → finish scan
+    // All segments done → finish scan
     if (userBandScan.currentSeg >= userBandScan.segmentsCount)
     {
       userBandScan.active = false;
 
-      DynamicJsonDocument done(256);
-      done["type"]             = "user.band_scan.done";
-      done["found"]            = userBandScan.found;
-      done["bestFrequencyMHz"] = userBandScan.bestFreq;
-      done["bestRssi"]         = userBandScan.bestRssi;
+      // For each remote (unique code), send one final detailed hit
+      for (uint8_t i = 0; i < userBandScan.hitsCount; i++)
+      {
+        BandScanHit &h = userBandScan.hits[i];
+        if (!h.used)
+          continue;
 
-      String out;
-      serializeJson(done, out);
-      notifyClients(out);
-      return;
+        DynamicJsonDocument res(256);
+        res["type"] = "user.band_scan.hit";
+        res["freq_MHz"] = h.bestFreq;
+        res["rssi"] = h.bestRssi;
+        res["code"] = h.code;
+        res["bits"] = h.bits;
+        res["delay_us"] = h.delayUs;
+
+        String out;
+        serializeJson(res, out);
+        notifyClients(out);
+      }
+
+      // هیچ user.band_scan.done ارسال نمی‌کنیم
     }
   }
 };
@@ -3381,5 +3481,6 @@ void loop()
   ElegantOTA.loop();
 #endif
 
+  scanNetworks();
   scanBand();
 };
